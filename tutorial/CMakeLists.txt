@@ -20,11 +20,16 @@ target_link_libraries(04_multiprocess PRIVATE blockmalloc)
 add_executable(05_multiprocess_multithread 05_multiprocess_multithread.c)
 target_link_libraries(05_multiprocess_multithread PRIVATE blockmalloc Threads::Threads)
 
+# -- 06: dead lock-holder takeover after SIGKILL --
+add_executable(06_crash_recovery 06_crash_recovery.c)
+target_link_libraries(06_crash_recovery PRIVATE blockmalloc)
+
 add_test(NAME 01_basic_alloc_free COMMAND 01_basic_alloc_free)
 add_test(NAME 02_alloc_max COMMAND 02_alloc_max)
 add_test(NAME 03_multithread COMMAND 03_multithread)
 add_test(NAME 04_multiprocess COMMAND 04_multiprocess)
 add_test(NAME 05_multiprocess_multithread COMMAND 05_multiprocess_multithread)
+add_test(NAME 06_crash_recovery COMMAND 06_crash_recovery)
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_definitions(01_basic_alloc_free PRIVATE ENABLE_LOG)

@@ -78,6 +78,19 @@ int64_t blockid_bydataoffset(const blocks_meta_t *meta, uint64_t data_offset);
 #if defined(_MSC_VER)
 #include <windows.h>
 #include <intrin.h>
+#else
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/types.h>
+#include <unistd.h>
+#if !defined(_POSIX_C_SOURCE) && !defined(_GNU_SOURCE) && !defined(_DEFAULT_SOURCE)
+int kill(pid_t pid, int sig);
+#endif
 #endif
 
 /* architecture-specific CPU-relax / pause */
@@ -91,41 +104,132 @@ static inline void cpu_relax(void) { YieldProcessor(); }
 static inline void cpu_relax(void) { (void)0; }
 #endif
 
-/* atomic exchange / store helpers (platform specific) */
 #ifdef _MSC_VER
-static inline int64_t spin_atomic_exchange(int64_t *ptr, int64_t val)
+static inline int64_t spin_self_pid(void)
 {
-    /* InterlockedExchange64 works with LONG64; cast to/from int64_t */
-    return (int64_t)InterlockedExchange64((volatile LONG64 *)ptr, (LONG64)val);
+    int64_t p = (int64_t)GetCurrentProcessId();
+    return p > 0 ? p : 1;
 }
-static inline void spin_atomic_store(int64_t *ptr, int64_t val)
+static inline int spin_lock_ex(int64_t *lock)
 {
-    /* Use InterlockedExchange64 as a store (returns previous, ignore it) */
-    InterlockedExchange64((volatile LONG64 *)ptr, (LONG64)val);
-}
-#else
-static inline int64_t spin_atomic_exchange(int64_t *ptr, int64_t val)
-{
-    return __atomic_exchange_n((int64_t *)ptr, val, __ATOMIC_ACQ_REL);
-}
-static inline void spin_atomic_store(int64_t *ptr, int64_t val)
-{
-    __atomic_store_n((int64_t *)ptr, val, __ATOMIC_RELEASE);
-}
-#endif
-
-static inline void spin_lock(int64_t *lock)
-{
-    while (spin_atomic_exchange(lock, 1))
+    int64_t me = spin_self_pid();
+    while (InterlockedCompareExchange64((volatile LONG64 *)lock, (LONG64)me, 0) != 0)
     {
         cpu_relax();
     }
+    return 0;
+}
+static inline void spin_lock(int64_t *lock)
+{
+    (void)spin_lock_ex(lock);
+}
+static inline void spin_unlock(int64_t *lock)
+{
+    InterlockedExchange64((volatile LONG64 *)lock, 0);
+}
+#else
+static _Thread_local int64_t bm_tls_pid;
+static pthread_once_t bm_atfork_once = PTHREAD_ONCE_INIT;
+
+static void bm_reset_tls_pid(void)
+{
+    bm_tls_pid = 0;
+}
+
+static void bm_install_atfork(void)
+{
+    (void)pthread_atfork(NULL, NULL, bm_reset_tls_pid);
+}
+
+static inline int64_t spin_self_pid(void)
+{
+    int64_t p = bm_tls_pid;
+    if (__builtin_expect(p <= 0, 0))
+    {
+        (void)pthread_once(&bm_atfork_once, bm_install_atfork);
+        p = (int64_t)getpid();
+        if (p <= 0)
+            p = 1;
+        bm_tls_pid = p;
+    }
+    return p;
+}
+
+static inline bool spin_pid_dead(int64_t owner)
+{
+    if (owner <= 0)
+        return false;
+    if (kill((pid_t)owner, 0) == -1 && errno == ESRCH)
+        return true;
+#if defined(__linux__)
+    char path[64];
+    int n = snprintf(path, sizeof(path), "/proc/%lld/stat", (long long)owner);
+    if (n > 0 && (size_t)n < sizeof(path))
+    {
+#ifdef O_CLOEXEC
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+#else
+        int fd = open(path, O_RDONLY);
+#endif
+        if (fd < 0)
+            return errno == ENOENT;
+        char buf[512];
+        ssize_t r = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (r > 0)
+        {
+            buf[r] = '\0';
+            char *rp = strrchr(buf, ')');
+            if (rp)
+            {
+                char *s = rp + 1;
+                while (*s == ' ')
+                    s++;
+                if (*s == 'Z' || *s == 'X')
+                    return true;
+            }
+        }
+    }
+#endif
+    return false;
+}
+
+/* Returns 1 if taken over from a dead/zombie owner, 0 on normal acquire. */
+static inline int spin_lock_ex(int64_t *lock)
+{
+    int64_t me = spin_self_pid();
+    for (;;)
+    {
+        int64_t expected = 0;
+        if (__atomic_compare_exchange_n(lock, &expected, me, false,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            return 0;
+        for (int spin = 0; spin < 4096; spin++)
+        {
+            cpu_relax();
+            if (__atomic_load_n(lock, __ATOMIC_RELAXED) == 0)
+                break;
+        }
+        int64_t owner = __atomic_load_n(lock, __ATOMIC_ACQUIRE);
+        if (owner > 0 && owner != me && spin_pid_dead(owner))
+        {
+            if (__atomic_compare_exchange_n(lock, &owner, me, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+                return 1;
+        }
+    }
+}
+
+static inline void spin_lock(int64_t *lock)
+{
+    (void)spin_lock_ex(lock);
 }
 
 static inline void spin_unlock(int64_t *lock)
 {
-    spin_atomic_store(lock, 0);
+    __atomic_store_n(lock, 0, __ATOMIC_RELEASE);
 }
+#endif
 
 #ifdef _MSC_VER
 #pragma pack(push, 1)
@@ -301,6 +405,63 @@ int64_t blockid_bydataoffset(const blocks_meta_t *meta, const uint64_t data_offs
     return blockid_byblockoffset(meta, data_offset - meta->sizeof_block_head);
 }
 
+static inline void bm_store_malloc_blocks(blocks_meta_t *meta, uint64_t n)
+{
+#ifdef _MSC_VER
+    meta->malloc_blocks = n;
+#else
+    /* sizeof_block_head:4 and malloc_blocks:60 share one 64-bit word. */
+    uint8_t head = meta->sizeof_block_head;
+    blocks_meta_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.sizeof_block_head = head;
+    tmp.malloc_blocks = n;
+    uint64_t word;
+    memcpy(&word, (const char *)&tmp + offsetof(blocks_meta_t, block_size) + sizeof(uint64_t), sizeof(word));
+    uint64_t *dst = (uint64_t *)((char *)meta + offsetof(blocks_meta_t, block_size) + sizeof(uint64_t));
+    __atomic_store_n(dst, word, __ATOMIC_RELEASE);
+#endif
+}
+
+/* Rebuild free_next_id and used_blocks from per-block headers under meta->lock. */
+static inline void blocks_repair_pool(blocks_meta_t *meta, void *block_start)
+{
+    uint64_t stride = BLOCK_SIZE(meta);
+    if (stride == 0)
+        return;
+    uint64_t max_b = meta->total_size / stride;
+    uint64_t mb = meta->malloc_blocks;
+    if (mb > max_b)
+    {
+        mb = max_b;
+        bm_store_malloc_blocks(meta, mb);
+    }
+    int64_t head_free = -1;
+    uint64_t used = 0;
+    for (uint64_t id = mb; id > 0; id--)
+    {
+        uint64_t bid = id - 1;
+        uint8_t *ptr = (uint8_t *)block_start + block_offset(meta, bid);
+        block64_t blk = getblock_t(meta, ptr);
+        if (blk.used == 1)
+        {
+            used++;
+        }
+        else
+        {
+            setblock_t(meta, ptr, 0, head_free);
+            head_free = (int64_t)bid;
+        }
+    }
+#ifdef _MSC_VER
+    meta->free_next_id = head_free;
+    meta->used_blocks = used;
+#else
+    __atomic_store_n(&meta->free_next_id, head_free, __ATOMIC_RELEASE);
+    __atomic_store_n(&meta->used_blocks, used, __ATOMIC_RELEASE);
+#endif
+}
+
 int64_t blocks_alloc(blocks_meta_t *meta, void *block_start)
 {
     if (meta == NULL || block_start == NULL)
@@ -308,25 +469,27 @@ int64_t blocks_alloc(blocks_meta_t *meta, void *block_start)
         LOG("[ERROR] meta or block_start is NULL");
         return -1;
     }
-    spin_lock(&meta->lock);
-    if (meta->free_next_id == -1)
+    if (spin_lock_ex(&meta->lock))
+        blocks_repair_pool(meta, block_start);
+    int64_t head_free = meta->free_next_id;
+    if (head_free == -1)
     {
-        uint64_t totalused_size = block_offset(meta, meta->malloc_blocks);
+        uint64_t cur_malloc = meta->malloc_blocks;
+        uint64_t totalused_size = block_offset(meta, cur_malloc);
         if (totalused_size + BLOCK_SIZE(meta) > meta->total_size)
         {
             LOG("[ERROR] out of memory,%zu(used_size)= %zu(malloc_blocks)*(sizeof(block_head)=%d)+%zu(block_size)),when total_size %zu",
-                totalused_size, (uint64_t)(meta->malloc_blocks), (uint8_t)(meta->sizeof_block_head), meta->block_size, meta->total_size);
+                totalused_size, cur_malloc, (uint8_t)(meta->sizeof_block_head), meta->block_size, meta->total_size);
             spin_unlock(&meta->lock);
             return -1;
         }
         else
         {
-            meta->malloc_blocks++;
-            meta->used_blocks++;
-
-            uint64_t block_id = meta->malloc_blocks - 1;
+            uint64_t block_id = cur_malloc;
             int64_t b_offset = block_offset(meta, block_id);
             setblock_t(meta, (uint8_t *)block_start + b_offset, 1, -1);
+            bm_store_malloc_blocks(meta, cur_malloc + 1);
+            meta->used_blocks++;
             LOG("[INFO] append block %zu,blocks usage: %zu/%zu", block_id, (uint64_t)(meta->used_blocks), (uint64_t)(meta->malloc_blocks));
             spin_unlock(&meta->lock);
             return block_id;
@@ -334,12 +497,17 @@ int64_t blocks_alloc(blocks_meta_t *meta, void *block_start)
     }
     else
     {
-        uint64_t free_id = meta->free_next_id;
+        uint64_t free_id = (uint64_t)head_free;
         int64_t b_offset = block_offset(meta, free_id);
         block64_t free_block = getblock_t(meta, (uint8_t *)block_start + b_offset);
-        meta->free_next_id = free_block.has_next_free ? (int64_t)free_block.next_free_id : -1;
-        meta->used_blocks++;
+        int64_t next_id = free_block.has_next_free ? (int64_t)free_block.next_free_id : -1;
         setblock_t(meta, (uint8_t *)block_start + b_offset, 1, -1);
+#ifdef _MSC_VER
+        meta->free_next_id = next_id;
+#else
+        __atomic_store_n(&meta->free_next_id, next_id, __ATOMIC_RELEASE);
+#endif
+        meta->used_blocks++;
 
         LOG("[INFO] reusing block %zu, blocks usage: %zu/%zu",
             free_id, (uint64_t)(meta->used_blocks), (uint64_t)(meta->malloc_blocks));
@@ -355,7 +523,8 @@ void blocks_free(blocks_meta_t *meta, void *block_start, const uint64_t block_id
         LOG("[ERROR] meta or block_start must not NULL");
         return;
     }
-    spin_lock(&meta->lock);
+    if (spin_lock_ex(&meta->lock))
+        blocks_repair_pool(meta, block_start);
     if (block_id >= meta->malloc_blocks)
     {
         LOG("[ERROR] block id %zu out of range", block_id);
@@ -372,7 +541,11 @@ void blocks_free(blocks_meta_t *meta, void *block_start, const uint64_t block_id
         break;
     case 1:
         setblock_t(meta, (uint8_t *)block_start + b_offset, 0, meta->free_next_id);
-        meta->free_next_id = block_id;
+#ifdef _MSC_VER
+        meta->free_next_id = (int64_t)block_id;
+#else
+        __atomic_store_n(&meta->free_next_id, (int64_t)block_id, __ATOMIC_RELEASE);
+#endif
         meta->used_blocks--;
         break;
     default:
